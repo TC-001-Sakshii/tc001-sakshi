@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from flask import Blueprint, jsonify, request
 
 from .db import get_db
-
+import sqlite3
 
 api = Blueprint("api", __name__)
 
@@ -102,11 +102,15 @@ def create_order():
     
     # All validations passed - now do the database operations
     db = get_db()
-    db.execute(
-        "INSERT INTO orders(order_id, customer_email, status, created_at) VALUES (?, ?, ?, ?)",
-        (order_id, customer_email, "CREATED", utc_now()),
-    )
-    db.commit()
+    try:
+        db.execute(
+            "INSERT INTO orders(order_id, customer_email, status, created_at) VALUES (?, ?, ?, ?)",
+            (order_id, customer_email, "CREATED", utc_now()),
+        )
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        return jsonify({"error": "Duplicate order ID"}), 409
 
     for item in items:
         sku = item["sku"]
