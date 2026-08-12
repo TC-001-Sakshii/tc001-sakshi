@@ -141,7 +141,10 @@ def create_order():
 @api.get("/api/orders/<order_id>")
 def get_order(order_id):
     db = get_db()
-    return jsonify({"order": serialize_order(db, order_id)}), 200
+    order = serialize_order(db, order_id)
+    if order is None:
+        return jsonify({"error": "Order not found"}), 404
+    return jsonify({"order": order}), 200
 
 
 @api.post("/api/orders/<order_id>/events")
