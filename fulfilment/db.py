@@ -8,6 +8,8 @@ def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(current_app.config["DATABASE_PATH"])
         g.db.row_factory = sqlite3.Row
+        # Enable foreign key constraint enforcement
+        g.db.execute("PRAGMA foreign_keys = ON")
     return g.db
 
 
