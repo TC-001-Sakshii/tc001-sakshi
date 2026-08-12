@@ -1,0 +1,30 @@
+### Health
+GET http://localhost:5000/health
+
+### Create an order
+POST http://localhost:5000/api/orders
+Content-Type: application/json
+
+{
+  "order_id": "ORD-1001",
+  "customer_email": "customer@example.com",
+  "items": [
+    {"sku": "SKU-KEYBOARD", "quantity": 2},
+    {"sku": "SKU-MOUSE", "quantity": 1}
+  ]
+}
+
+### Get an order
+GET http://localhost:5000/api/orders/ORD-1001
+
+### Allocate inventory
+POST http://localhost:5000/api/orders/ORD-1001/events
+Content-Type: application/json
+
+{
+  "event_id": "EVT-1001-A",
+  "status": "ALLOCATED"
+}
+
+### Fulfilment report
+GET http://localhost:5000/api/reports/fulfilment
