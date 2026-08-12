@@ -163,56 +163,111 @@ def get_order(order_id):
 
 @api.post("/api/orders/<order_id>/events")
 def add_event(order_id):
-    payload = request.get_json(silent=True) or {}
+    # Validate JSON is present and is an object
+    payload = request.get_json(silent=True)
+    if payload is None or not isinstance(payload, dict):
+        return jsonify({"error": "Request body must be valid JSON object"}), 400
+    
     event_id = payload.get("event_id")
     new_status = payload.get("status")
+    
+    # Validate event_id and status are non-empty strings
+    if not event_id or not isinstance(event_id, str) or event_id.strip() == "":
+        return jsonify({"error": "event_id must be a non-empty string"}), 400
+    if not new_status or not isinstance(new_status, str) or new_status.strip() == "":
+        return jsonify({"error": "status must be a non-empty string"}), 400
+    
+    # Validate status is supported
+    valid_statuses = {"CREATED", "ALLOCATED", "SHIPPED", "DELIVERED", "CANCELLED"}
+    if new_status not in valid_statuses:
+        return jsonify({"error": f"unsupported status: {new_status}"}), 400
+    
     db = get_db()
-
+    
     order = db.execute(
         "SELECT order_id, status FROM orders WHERE order_id = ?", (order_id,)
     ).fetchone()
     if order is None:
         return jsonify({"error": "Order not found"}), 404
-
+    
+    current_status = order["status"]
+    
+    # Check if event_id already exists
+    existing_event = db.execute(
+        "SELECT event_id, new_status, order_id FROM order_events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    
+    if existing_event is not None:
+        # Event ID already used
+        if existing_event["order_id"] == order_id and existing_event["new_status"] == new_status:
+            # Idempotent retry - same event
+            return (
+                jsonify(
+                    {
+                        "event_id": event_id,
+                        "duplicate": True,
+                        "order": serialize_order(db, order_id),
+                    }
+                ),
+                200,
+            )
+        else:
+            # Event ID reused for different order or status
+            return jsonify({"error": "Duplicate event_id"}), 409
+    
+    # Define strict status transitions: CREATED -> ALLOCATED -> SHIPPED -> DELIVERED
     allowed_transitions = {
-        "CREATED": {"ALLOCATED", "SHIPPED", "CANCELLED"},
+        "CREATED": {"ALLOCATED", "CANCELLED"},
         "ALLOCATED": {"SHIPPED", "CANCELLED"},
-        "SHIPPED": {"DELIVERED", "CANCELLED"},
+        "SHIPPED": {"DELIVERED"},
         "DELIVERED": set(),
         "CANCELLED": set(),
     }
-
-    if new_status not in allowed_transitions.get(order["status"], set()):
+    
+    if new_status not in allowed_transitions.get(current_status, set()):
         return (
             jsonify(
                 {
                     "error": "Invalid status transition",
-                    "from": order["status"],
+                    "from": current_status,
                     "to": new_status,
                 }
             ),
             409,
         )
-
-    db.execute(
-        "INSERT INTO order_events(event_id, order_id, new_status, created_at) VALUES (?, ?, ?, ?)",
-        (event_id, order_id, new_status, utc_now()),
-    )
-    db.commit()
-
-    db.execute("UPDATE orders SET status = ? WHERE order_id = ?", (new_status, order_id))
-    db.commit()
-
-    if new_status == "CANCELLED":
-        items = db.execute(
-            "SELECT sku, quantity FROM order_items WHERE order_id = ?", (order_id,)
-        ).fetchall()
-        for item in items:
-            db.execute(
-                "UPDATE inventory SET available_quantity = available_quantity + ? WHERE sku = ?",
-                (item["quantity"], item["sku"]),
-            )
-            db.commit()
+    
+    # Execute entire event operation atomically
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        
+        # Insert event
+        db.execute(
+            "INSERT INTO order_events(event_id, order_id, new_status, created_at) VALUES (?, ?, ?, ?)",
+            (event_id, order_id, new_status, utc_now()),
+        )
+        
+        # Update order status
+        db.execute("UPDATE orders SET status = ? WHERE order_id = ?", (new_status, order_id))
+        
+        # Handle inventory restoration for cancellation
+        if new_status == "CANCELLED":
+            items = db.execute(
+                "SELECT sku, quantity FROM order_items WHERE order_id = ?", (order_id,)
+            ).fetchall()
+            for item in items:
+                db.execute(
+                    "UPDATE inventory SET available_quantity = available_quantity + ? WHERE sku = ?",
+                    (item["quantity"], item["sku"]),
+                )
+        
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        return jsonify({"error": "Duplicate event_id"}), 409
+    except Exception:
+        db.rollback()
+        raise
 
     return (
         jsonify(
@@ -232,15 +287,12 @@ def fulfilment_report():
     report = db.execute(
         """
         SELECT
-            COUNT(o.order_id) AS total_orders,
-            SUM(CASE WHEN o.status = 'DELIVERED' THEN 1 ELSE 0 END) AS delivered_orders,
-            SUM(CASE WHEN o.status = 'CANCELLED' THEN 1 ELSE 0 END) AS cancelled_orders,
-            SUM(CASE WHEN o.status IN ('CREATED', 'ALLOCATED', 'SHIPPED') THEN 1 ELSE 0 END) AS pending_orders,
-            COALESCE(SUM(oi.quantity), 0) AS total_ordered_quantity,
-            COALESCE(SUM(CASE WHEN o.status = 'DELIVERED' THEN oi.quantity ELSE 0 END), 0) AS total_delivered_quantity
-        FROM orders o
-        LEFT JOIN order_items oi ON oi.order_id = o.order_id
-        LEFT JOIN order_events oe ON oe.order_id = o.order_id
+            (SELECT COUNT(*) FROM orders) AS total_orders,
+            (SELECT COUNT(*) FROM orders WHERE status = 'DELIVERED') AS delivered_orders,
+            (SELECT COUNT(*) FROM orders WHERE status = 'CANCELLED') AS cancelled_orders,
+            (SELECT COUNT(*) FROM orders WHERE status IN ('CREATED', 'ALLOCATED', 'SHIPPED')) AS pending_orders,
+            COALESCE((SELECT SUM(quantity) FROM order_items), 0) AS total_ordered_quantity,
+            COALESCE((SELECT SUM(quantity) FROM order_items oi INNER JOIN orders o ON oi.order_id = o.order_id WHERE o.status = 'DELIVERED'), 0) AS total_delivered_quantity
         """
     ).fetchone()
     return jsonify({key: report[key] or 0 for key in report.keys()})
