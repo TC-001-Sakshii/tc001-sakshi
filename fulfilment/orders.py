@@ -40,7 +40,11 @@ def health():
 
 @api.post("/api/orders")
 def create_order():
-    payload = request.get_json(silent=True) or {}
+    # Validate JSON is present and is an object
+    payload = request.get_json(silent=True)
+    if payload is None or not isinstance(payload, dict):
+        return jsonify({"error": "Request body must be valid JSON object"}), 400
+    
     order_id = payload.get("order_id")
     customer_email = payload.get("customer_email", "")
     items = payload.get("items", [])
