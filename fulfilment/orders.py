@@ -33,6 +33,13 @@ def serialize_order(db, order_id):
     }
 
 
+def is_valid_email(email):
+    """Basic email validation"""
+    import re
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return re.match(pattern, email) is not None
+
+
 @api.get("/health")
 def health():
     return jsonify({"status": "ok"})
@@ -49,6 +56,51 @@ def create_order():
     customer_email = payload.get("customer_email", "")
     items = payload.get("items", [])
 
+    # Validate order_id
+    if not order_id or not isinstance(order_id, str) or order_id.strip() == "":
+        return jsonify({"error": "order_id must be a non-empty string"}), 400
+    
+    # Validate customer_email
+    if not customer_email or not isinstance(customer_email, str) or customer_email.strip() == "":
+        return jsonify({"error": "customer_email must be a non-empty string"}), 400
+    if not is_valid_email(customer_email):
+        return jsonify({"error": "customer_email must be a valid email address"}), 400
+    
+    # Validate items
+    if not items or not isinstance(items, list):
+        return jsonify({"error": "items must be a non-empty array"}), 400
+    
+    # Validate each item and check for duplicates
+    seen_skus = set()
+    for item in items:
+        if not isinstance(item, dict):
+            return jsonify({"error": "each item must be an object"}), 400
+        
+        sku = item.get("sku")
+        quantity = item.get("quantity")
+        
+        # Validate sku
+        if not sku or not isinstance(sku, str) or sku.strip() == "":
+            return jsonify({"error": "item sku must be a non-empty string"}), 400
+        
+        # Check for duplicate SKUs
+        if sku in seen_skus:
+            return jsonify({"error": f"duplicate sku in order: {sku}"}), 400
+        seen_skus.add(sku)
+        
+        # Validate quantity - must be positive integer
+        if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity <= 0:
+            return jsonify({"error": f"item quantity must be a positive integer, got {quantity}"}), 400
+        
+        # Check SKU exists in inventory
+        db = get_db()
+        inventory = db.execute(
+            "SELECT available_quantity FROM inventory WHERE sku = ?", (sku,)
+        ).fetchone()
+        if inventory is None:
+            return jsonify({"error": f"unknown sku: {sku}"}), 400
+    
+    # All validations passed - now do the database operations
     db = get_db()
     db.execute(
         "INSERT INTO orders(order_id, customer_email, status, created_at) VALUES (?, ?, ?, ?)",
@@ -58,12 +110,12 @@ def create_order():
 
     for item in items:
         sku = item["sku"]
-        quantity = int(item["quantity"])
+        quantity = item["quantity"]
         inventory = db.execute(
             "SELECT available_quantity FROM inventory WHERE sku = ?", (sku,)
         ).fetchone()
 
-        if inventory is None or inventory["available_quantity"] <= quantity:
+        if inventory["available_quantity"] < quantity:
             return (
                 jsonify({"error": "Insufficient inventory", "sku": sku}),
                 409,
