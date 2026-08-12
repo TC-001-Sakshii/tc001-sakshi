@@ -100,40 +100,54 @@ def create_order():
         if inventory is None:
             return jsonify({"error": f"unknown sku: {sku}"}), 400
     
-    # All validations passed - now do the database operations
+    # All validations passed - check inventory availability before transaction
     db = get_db()
-    try:
-        db.execute(
-            "INSERT INTO orders(order_id, customer_email, status, created_at) VALUES (?, ?, ?, ?)",
-            (order_id, customer_email, "CREATED", utc_now()),
-        )
-        db.commit()
-    except sqlite3.IntegrityError:
-        db.rollback()
-        return jsonify({"error": "Duplicate order ID"}), 409
-
+    
+    # Pre-check all inventory levels to avoid partial failures
     for item in items:
         sku = item["sku"]
         quantity = item["quantity"]
         inventory = db.execute(
             "SELECT available_quantity FROM inventory WHERE sku = ?", (sku,)
         ).fetchone()
-
+        
         if inventory["available_quantity"] < quantity:
             return (
                 jsonify({"error": "Insufficient inventory", "sku": sku}),
                 409,
             )
-
+    
+    # All inventory checks passed - execute atomic transaction
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        
+        # Insert order
         db.execute(
-            "UPDATE inventory SET available_quantity = available_quantity - ? WHERE sku = ?",
-            (quantity, sku),
+            "INSERT INTO orders(order_id, customer_email, status, created_at) VALUES (?, ?, ?, ?)",
+            (order_id, customer_email, "CREATED", utc_now()),
         )
-        db.execute(
-            "INSERT INTO order_items(order_id, sku, quantity) VALUES (?, ?, ?)",
-            (order_id, sku, quantity),
-        )
+        
+        # Insert all items and update inventory atomically
+        for item in items:
+            sku = item["sku"]
+            quantity = item["quantity"]
+            
+            db.execute(
+                "UPDATE inventory SET available_quantity = available_quantity - ? WHERE sku = ?",
+                (quantity, sku),
+            )
+            db.execute(
+                "INSERT INTO order_items(order_id, sku, quantity) VALUES (?, ?, ?)",
+                (order_id, sku, quantity),
+            )
+        
         db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        return jsonify({"error": "Duplicate order ID"}), 409
+    except Exception:
+        db.rollback()
+        raise
 
     return jsonify({"order": serialize_order(db, order_id)}), 201
 
